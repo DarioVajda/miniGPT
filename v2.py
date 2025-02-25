@@ -124,6 +124,24 @@ class FeedForward(nn.Module):
         return self.net(x)
 #endregion
 
+#region Layer Normalization
+class MyLayerNorm:
+    def __init__(self, dim, eps=1e-5):
+        self.eps = eps
+        self.gamma = torch.ones(dim)
+        self.beta = torch.zeros(dim)
+
+    def __call__(self, x):
+        xmean = x.mean(1, keepdim=True)
+        xvar = x.var(1, keepdim=True)
+        xhat = (x - xmean) / torch.sqrt(xvar + self.eps)
+        self.out = self.gamma * xhat + self.beta
+        return self.out
+    
+    def parameters(self):
+        return [self.gamma, self.beta]
+#endregion
+
 #region Block
 class Block(nn.Module):
     """ This is a Transformer Block with Multi-Head Attention and Feed Forward Layer"""
@@ -133,10 +151,12 @@ class Block(nn.Module):
         head_size = n_embd // n_head
         self.self_attention_heads = MultiHeadAttention(num_heads=n_head, head_size=head_size)
         self.feed_forward = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
     
     def forward(self, x):
-        x = x + self.self_attention_heads(x)
-        x = x + self.feed_forward(x)
+        x = x + self.self_attention_heads(self.ln1(x))
+        x = x + self.feed_forward(self.ln2(x))
         return x
 #endregion
 
@@ -150,6 +170,7 @@ class AttentionLanguageModel(nn.Module):
             Block(n_embd, n_head=4),
             Block(n_embd, n_head=4),
             Block(n_embd, n_head=4),
+            nn.LayerNorm(n_embd),
         )
         self.lm_head = nn.Linear(n_embd, vocab_size)
     
