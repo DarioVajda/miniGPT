@@ -100,9 +100,44 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
     
     def forward(self, x):
-        return torch.cat([head(x) for head in self.heads], dim=-1)
+        out = torch.cat([head(x) for head in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+#endregion
+
+#region Feed Forward Layer
+class FeedForward(nn.Module):
+    """ This is a simple Multi-Layer Perceptron"""
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd), # this is the projection layer going back into the residual pathway
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+#endregion
+
+#region Block
+class Block(nn.Module):
+    """ This is a Transformer Block with Multi-Head Attention and Feed Forward Layer"""
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.self_attention_heads = MultiHeadAttention(num_heads=n_head, head_size=head_size)
+        self.feed_forward = FeedForward(n_embd)
+    
+    def forward(self, x):
+        x = x + self.self_attention_heads(x)
+        x = x + self.feed_forward(x)
+        return x
 #endregion
 
 #region Defining the model
@@ -111,7 +146,11 @@ class AttentionLanguageModel(nn.Module):
         super().__init__()
         self.token_embdding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(context_length, n_embd)
-        self.self_attention_heads = MultiHeadAttention(num_heads=4, head_size=n_embd//4)
+        self.blocks = nn.Sequential(
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+        )
         self.lm_head = nn.Linear(n_embd, vocab_size)
     
     def forward(self, idx, targets=None):
@@ -119,9 +158,9 @@ class AttentionLanguageModel(nn.Module):
 
         # shapes of idx and targets are [batch_size, context_size]
         tok_emb = self.token_embdding_table(idx)                                    # shape: [batch_size, context_size, embd_size]
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))    # shape: [context_size, embd_size]
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))     # shape: [context_size, embd_size]
         x = tok_emb + pos_emb                                                       # shape: [batch_size, context_size, embd_size]
-        x = self.self_attention_heads(x)                                             # shape: [batch_size, context_size, embd_size]
+        x = self.blocks(x)                                                          # shape: [batch_size, context_size, embd_size]
         logits = self.lm_head(x)                                                    # shape: [batch_size, context_size, vocab_size]
 
         # F.cross_entropy expects batch_size x CHANNELS x d_2 x d_3...
