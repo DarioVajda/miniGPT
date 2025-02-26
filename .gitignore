@@ -5,3 +5,6 @@ venv/
 
 # macOS
 .DS_Store
+
+# Jupyter checkpoints
+.checkpoints/
