@@ -8,3 +8,12 @@ venv/
 
 # Jupyter checkpoints
 checkpoints/*
+
+captions_dataset/train
+captions_dataset/validation
+captions_dataset/*.tsv
+
+miniVLM/dataset/tokenized_ccnews_50m_eval.txt
+miniVLM/dataset/tokenized_ccnews_5b.txt
+miniVLM/dataset/tokenized_train_captions_dataset.txt
+miniVLM/dataset/tokenized_val_captions_dataset.txt
