@@ -4,6 +4,7 @@ This is a personal project divided into three parts:
 1. Implementation of a Generative Pretrained Transformer (GPT) model trained on Tiny Shakespeare
 2. Implementation of a Vision Transformer (ViT) model trained for image classification
 3. Implementation of a Vision Language Model (VLM) trained on a large corpora of text and images.
+
 *Note* - each model was implemented in plain PyTorch to demonstrate the fundemental understanding of both the library and the underlying architectures of the transformer and models that rely on it.
 
 ## Generative Pretrained Transformer
