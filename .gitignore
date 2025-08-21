@@ -18,3 +18,6 @@ miniVLM/dataset/tokenized_ccnews_50m_eval.txt
 miniVLM/dataset/tokenized_ccnews_5b.txt
 miniVLM/dataset/tokenized_train_captions_dataset.txt
 miniVLM/dataset/tokenized_val_captions_dataset.txt
+
+# checkpoint files
+miniVLM/**/*.pt

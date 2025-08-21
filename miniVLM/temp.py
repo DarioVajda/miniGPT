@@ -20,7 +20,6 @@ import math
 from torch import nn
 from tqdm import tqdm
 import torchvision.transforms as T
-import json
 
 # ----------------- Checkpoint helpers imports -----------------
 import random
@@ -33,7 +32,7 @@ text_batch_size = 1
 captions_batch_size = 4
 
 train_tokens = 50_000_000  # 50m tokens (for testing) ---> 5_000_000_000 for full training
-eval_tokens = 100_000  # 50k tokens (for testing)  ---> 50_000_000 for full validation
+eval_tokens = 50_000  # 50k tokens (for testing)  ---> 50_000_000 for full validation
 eval_steps = train_tokens//25 # Evaluate ~25 times during training
 
 base_lr      = 3e-4
@@ -324,6 +323,29 @@ def autocast_ctx():
     return nullcontext()
 
 @torch.no_grad()
+def text_eval_prev(model, val_text_dataloader, eval_tokens, device):
+    print("Evaluating text dataset...")
+    text_eval_loss = 0.0
+    text_eval_examples = 0
+    eval_tokens_processed = 0
+    for text_eval_batch, _ in tqdm(val_text_dataloader):
+        # move batch to device
+        text_eval_batch = [t.to(device) for t in text_eval_batch]
+        text_eval_examples += 1
+        # forward pass --> calculate loss
+        logits, loss = model(text_eval_batch, None, calculate_loss=True)
+        text_eval_loss += loss.item()
+
+        # update processed tokens
+        eval_tokens_processed += len(text_eval_batch) * text_eval_batch[0].shape[0]
+        if eval_tokens_processed >= eval_tokens:
+            break
+
+    text_eval_loss /= text_eval_examples
+    print("Finished evaluating text dataset.")
+    return text_eval_loss
+
+@torch.no_grad()
 def text_eval(model, val_text_loader, eval_tokens, device):
     world = dist.get_world_size() if dist.is_initialized() else 1
     rank  = dist.get_rank()        if dist.is_initialized() else 0
@@ -354,6 +376,20 @@ def text_eval(model, val_text_loader, eval_tokens, device):
     global_avg_loss = loss_sum_g / max(1, tok_sum_g)
     return global_avg_loss  # you can also return math.exp(global_avg_loss) for ppl
 
+
+@torch.no_grad()
+def captions_eval_prev(model, val_captions_dataloader, device):
+    print("Evaluating captions dataset...")
+    captions_eval_loss = 0.0
+    for captions_eval_batch_txt, captions_eval_batch_img in tqdm(val_captions_dataloader):
+        captions_eval_batch_txt = [c.to(device) for c in captions_eval_batch_txt]
+        captions_eval_batch_img = [ [img[0].to(device)] for img in captions_eval_batch_img ]
+        logits, loss = model(captions_eval_batch_txt, captions_eval_batch_img, calculate_loss=True)
+        captions_eval_loss += loss.item()
+    captions_eval_loss /= len(val_captions_dataloader)
+    print("Finished evaluating captions dataset.")
+    return captions_eval_loss
+
 @torch.no_grad()
 def captions_eval(model, val_captions_loader, device):
     world = dist.get_world_size() if dist.is_initialized() else 1
@@ -382,27 +418,6 @@ def captions_eval(model, val_captions_loader, device):
 
 #endregion
 
-#region Logging progress
-
-# this function will log a json object with all training progress stats in the given jsonl file
-def log_progress(path, data):
-    """
-    Log a dictionary of data to a JSONL file.
-    Each call appends a new line with the JSON representation of the data.
-    """
-    if not isinstance(data, dict):
-        raise ValueError("Data must be a dictionary.")
-    
-    # Ensure the directory exists
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    with open(path, "a") as f:
-        json_line = json.dumps(data, ensure_ascii=False) + "\n"
-        f.write(json_line)
-        f.flush()  # Ensure data is written immediately
-
-#endregion
-
 def setup_distributed():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -412,30 +427,15 @@ def setup_distributed():
 def main():
     # ----------------- Arg parsing for checkpointing -------------------
     ap = argparse.ArgumentParser()
-    ap.add_argument("--output", type=str, default=None, help="Path to a directory where checkpoints, training/validation losses and other data will be saved.")
-    ap.add_argument("--should_checkpoint", action="store_true", help="If set, will save checkpoints periodically based on --checkpoint_every.")
+    ap.add_argument("--checkpoint_path", type=str, default=None, help="Path to a single-file checkpoint (.pt). If provided and exists, resume; if provided and missing, start fresh and save here.")
     ap.add_argument("--checkpoint_every", type=int, default=0, help="Save every N UPDATE steps (i.e., optimizer steps). 0 disables periodic saving.")
     args = ap.parse_args()
-
-    # checkpoint path will be "output/path/latest_checkpoint.pt" if output is set, otherwise None
-    if args.output is not None and args.should_checkpoint:
-        checkpoint_path = os.path.join(args.output, "latest_checkpoint.pt")
-    else:
-        checkpoint_path = None
     # -------------------------------------------------------------------
 
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
     print(f"[Rank {rank}] Local Rank: {local_rank}, World Size: {world_size}")
     torch.manual_seed(42)  # reproducible-ish across ranks
-
-    # Make the output directory if it doesn't exist
-    if local_rank == 0:
-        if args.output is not None:
-            os.makedirs(args.output, exist_ok=True)
-            print(f"Output directory set to: {args.output}")
-        else:
-            print("No output directory specified; checkpoints and other stats will not be saved.")
 
 
     # Get the text dataset
@@ -458,24 +458,24 @@ def main():
     NEXT_EVAL = 1       # Next evaluation (how many evaluations were performed + 1)
     tokens_per_batch = text_batch_size + (MAX_SEQUENCE_LENGTH + 2) * world_size
     RESUMED_ELAPSED = 0.0  # seconds of training time accumulated before this run
-    TEXT_EX_SEEN_LOCAL = 0  # Number of text examples seen in this DDP process so far (including previous runs)
-    CAPS_EX_SEEN_LOCAL = 0  # Number of captions examples seen in this DDP process so far (including previous runs)
+    TEXT_EX_SEEN_LOCAL = 0
+    CAPS_EX_SEEN_LOCAL = 0
 
     # ------------ Optional: Resume from checkpoint if provided -----------
     resumed = False
     to_skip_text_local = 0
     to_skip_caps_local = 0
-    if checkpoint_path is not None:
-        if os.path.exists(checkpoint_path):
-            if rank == 0: print(f"[ckpt] Loading checkpoint from {checkpoint_path}")
-            ckpt = load_checkpoint(checkpoint_path, model, optim, sched, device)
+    if args.checkpoint_path is not None:
+        if os.path.exists(args.checkpoint_path):
+            if rank == 0: print(f"[ckpt] Loading checkpoint from {args.checkpoint_path}")
+            ckpt = load_checkpoint(args.checkpoint_path, model, optim, sched, device)
             if ckpt is not None:
                 TRAINING_STEPS = int(ckpt.get("training_steps", TRAINING_STEPS))
                 UPDATE_STEPS  = int(ckpt.get("update_steps", UPDATE_STEPS))
                 TOTAL_TOKENS   = int(ckpt.get("total_tokens", TOTAL_TOKENS))
                 NEXT_EVAL      = int(ckpt.get("next_eval", NEXT_EVAL))
                 RESUMED_ELAPSED = float(ckpt.get("meta", {}).get("elapsed_train_seconds", 0.0))
-                # ---- derive how many examples to fast-forward per rank ----
+                # ---- NEW: derive how many examples to fast-forward per rank
                 le = ckpt.get("loader_examples", {})
                 saved_ws = int(le.get("world_size", world_size))
                 text_global = int(le.get("text_global", 0))
@@ -498,16 +498,16 @@ def main():
                     print(f"[ckpt] Resumed: micro-steps={TRAINING_STEPS}, updates={UPDATE_STEPS}, tokens={TOTAL_TOKENS}, next_eval={NEXT_EVAL}, elapsed_train_seconds={RESUMED_ELAPSED:.1f}s")
                     print(f"[ckpt] Fast-forward plan (rank {rank}): text_examples={to_skip_text_local}, caps_examples={to_skip_caps_local}")
         else:
-            if rank == 0: print(f"[ckpt] No existing file at {checkpoint_path}. Starting fresh; will save checkpoints there.")
+            if rank == 0: print(f"[ckpt] No existing file at {args.checkpoint_path}. Starting fresh; will save checkpoints there.")
     else:
         if rank == 0 and args.checkpoint_every > 0:
-            print("[ckpt] --checkpoint_every is set but checkpoint_path (--output) is None; checkpoint saving is disabled.")
+            print("[ckpt] --checkpoint_every is set but --checkpoint_path is None; checkpoint saving is disabled.")
 
     # Important: recreate fresh iterators after a resume to align with restored RNG (best-effort)
     if resumed:
         text_dataset_iter = iter(train_text_loader)
         captions_dataset_iter = iter(train_captions_loader)
-        # --------- fast-forward by examples (CPU only, no .to(device)) ----------
+        # --------- NEW: fast-forward by examples (CPU only, no .to(device)) ----------
         # Text (iterable)
         skipped = 0
         while skipped < to_skip_text_local:
@@ -575,31 +575,35 @@ def main():
             UPDATE_STEPS += 1
 
             # ---- Periodic checkpoint on UPDATE steps ----
-            if (checkpoint_path is not None) and (args.checkpoint_every > 0) and (UPDATE_STEPS % args.checkpoint_every == 0):
+            if (args.checkpoint_path is not None) and (args.checkpoint_every > 0) and (UPDATE_STEPS % args.checkpoint_every == 0):
                 if rank == 0:
                     elapsed_for_ckpt = RESUMED_ELAPSED + (time.time() - training_start_time)
-                    # ---- NEW: compute "global" from local rank0 counts; avoid all collectives  # <--- NEW
-                    text_g = int(TEXT_EX_SEEN_LOCAL) * world_size  # <--- NEW
-                    caps_g = int(CAPS_EX_SEEN_LOCAL) * world_size  # <--- NEW
-                    text_list = [int(TEXT_EX_SEEN_LOCAL)] * world_size  # <--- NEW
-                    caps_list = [int(CAPS_EX_SEEN_LOCAL)] * world_size  # <--- NEW
-
-                    loader_examples = {  # <--- NEW
-                        "world_size": world_size,         # <--- NEW
-                        "text_global": text_g,            # <--- NEW
-                        "caps_global": caps_g,            # <--- NEW
-                        "text_per_rank": text_list,       # <--- NEW
-                        "caps_per_rank": caps_list,       # <--- NEW
-                    }  # <--- NEW
-
-                    print(f"[ckpt] Saving checkpoint at updates={UPDATE_STEPS}, micro-steps={TRAINING_STEPS}, tokens={TOTAL_TOKENS} → {checkpoint_path}")
-                    save_checkpoint(checkpoint_path, model, optim, sched, TRAINING_STEPS, UPDATE_STEPS, TOTAL_TOKENS, NEXT_EVAL, elapsed_for_ckpt, loader_examples)  # <--- NEW
-                if dist.is_initialized(): dist.barrier()  # keep ranks in sync after save (optional, harmless)
+                    # ---- NEW: package loader example progress (global + per-rank)
+                    text_g, caps_g = ddp_sum_scalars([TEXT_EX_SEEN_LOCAL, CAPS_EX_SEEN_LOCAL], device=device)
+                    text_g, caps_g = int(text_g), int(caps_g)
+                    text_list = [0] * world_size
+                    caps_list = [0] * world_size
+                    if dist.is_initialized():
+                        tmp = [None] * world_size
+                        dist.all_gather_object(tmp, int(TEXT_EX_SEEN_LOCAL))
+                        text_list = [int(x) for x in tmp]
+                        tmp = [None] * world_size
+                        dist.all_gather_object(tmp, int(CAPS_EX_SEEN_LOCAL))
+                        caps_list = [int(x) for x in tmp]
+                    loader_examples = {
+                        "world_size": world_size,
+                        "text_global": text_g,   
+                        "caps_global": caps_g,   
+                        "text_per_rank": text_list,
+                        "caps_per_rank": caps_list,
+                    }
+                    print(f"[ckpt] Saving checkpoint at updates={UPDATE_STEPS}, micro-steps={TRAINING_STEPS}, tokens={TOTAL_TOKENS} → {args.checkpoint_path}")
+                    save_checkpoint(args.checkpoint_path, model, optim, sched, TRAINING_STEPS, UPDATE_STEPS, TOTAL_TOKENS, NEXT_EVAL, elapsed_for_ckpt, loader_examples)
+                if dist.is_initialized(): dist.barrier()  # keep ranks in sync after save
         # -------------------------------------------------------------------
 
         # ------------ Evaluation (every `eval_steps` tokens) ---------------
         if TOTAL_TOKENS >= NEXT_EVAL * eval_steps:
-            start_eval_time = time.time()
             model.eval()
 
             if rank == 0: print(f"Starting evaluation #{NEXT_EVAL} at {nice_num(TOTAL_TOKENS)} tokens...")
@@ -611,21 +615,6 @@ def main():
             model.train()  
 
             NEXT_EVAL += 1
-            eval_time = time.time() - start_eval_time
-            if rank == 0: print(f"Evaluation #{NEXT_EVAL-1} took {eval_time:.2f} seconds.")
-
-            # Log evaluation results to a JSONL file (optional)
-            if args.output is not None and rank == 0:
-                eval_log_data = {
-                    "eval_step": NEXT_EVAL - 1,
-                    "text_loss": text_eval_loss,
-                    "captions_loss": captions_eval_loss,
-                    "total_tokens": TOTAL_TOKENS,
-                    "elapsed_seconds": time.time() - training_start_time,
-                }
-                log_progress(os.path.join(args.output, "eval.jsonl"), eval_log_data)
-        else:
-            eval_time = 0.0
         # -------------------------------------------------------------------
 
         end_time = time.time()
@@ -633,7 +622,7 @@ def main():
         tok_per_sec = TOTAL_TOKENS / max(total_elapsed, 1e-9)
         remaining_tokens = max(train_tokens - TOTAL_TOKENS, 0)
         eta_seconds = remaining_tokens / max(tok_per_sec, 1e-9)
-        if rank == 0: print(f"{TRAINING_STEPS}. {nice_num(TOTAL_TOKENS)}/{nice_num(train_tokens)} tokens ({(end_time-start_time-eval_time):.2f} s/it; {nice_num(tok_per_sec)} tok/s) - {nice_time(eta_seconds)} left", end='')  # <--- NEW
+        if rank == 0: print(f"{TRAINING_STEPS}. {nice_num(TOTAL_TOKENS)}/{nice_num(train_tokens)} tokens ({(end_time-start_time):.2f} s/it; {nice_num(tok_per_sec)} tok/s) - {nice_time(eta_seconds)} left", end='')
         if rank == 0: print(f" | Text Loss: {text_loss:.4f}", end='')
         if rank == 0: print(f" | Captions Loss: {captions_loss:.4f}", end='')
         if sync_now:
@@ -641,23 +630,6 @@ def main():
         if rank == 0: print()
         # print format:
         # 1. 50M/5B tokens (1.23 s/it; 2.3k tok/s) - 1h 30m left | Text Loss: 2.3456 | Captions Loss: 1.2345 | UPDATED with LR: 0.000300
-
-        # log progress to a JSONL file (optional)
-        if args.output is not None and rank == 0:
-            log_data = {
-                "training_steps": TRAINING_STEPS,
-                "update_steps": UPDATE_STEPS,
-                "total_tokens": TOTAL_TOKENS,
-                "next_eval": NEXT_EVAL,
-                "elapsed_train_seconds": total_elapsed,
-                "text_loss": text_loss,
-                "captions_loss": captions_loss,
-                "time_per_step": end_time - start_time - eval_time,  # Time taken for this step
-                "tokens_per_second": tok_per_sec,  # Tokens processed per second
-                "learning_rate": optim.param_groups[0]["lr"],
-                "tokens_per_step": tokens_per_batch,  # Approximate number of tokens processed in this step
-            }
-            log_progress(os.path.join(args.output, "train.jsonl"), log_data)
 
 
     dist.destroy_process_group()
