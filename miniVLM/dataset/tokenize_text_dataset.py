@@ -1,8 +1,8 @@
 import sentencepiece as spm
 import tqdm
 
-txt_dataset_path = "/workspace/corpuses/cc_news/ccnews_50m_eval.txt"
-tokenized_dataset_path = "tokenized_ccnews_50m_eval.txt"
+txt_dataset_path = "/ceph/hpc/data/s24o01-42-users/corpuses/cc_news/ccnews_5b_tokens.txt"
+tokenized_dataset_path = "tokenized_ccnews_5b.txt"
 
 sp = spm.SentencePieceProcessor(model_file="../tokenizer/mini_vlm_sp16k.model")
 

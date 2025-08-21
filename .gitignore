@@ -12,6 +12,7 @@ checkpoints/*
 captions_dataset/train
 captions_dataset/validation
 captions_dataset/*.tsv
+captions_dataset/logs
 
 miniVLM/dataset/tokenized_ccnews_50m_eval.txt
 miniVLM/dataset/tokenized_ccnews_5b.txt

@@ -29,7 +29,7 @@ def check_image(path: Path) -> tuple[Path | None, str | None]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root directory with images (scans recursively).")
-    ap.add_argument("--exts", default="jpg,jpeg,png,webp", help="Comma-separated extensions to scan.")
+    ap.add_argument("--exts", default="jpg, help="Comma-separated extensions to scan.")
     ap.add_argument("--out", default=None, help="Optional path to write bad file list.")
     ap.add_argument("--workers", type=int, default=8, help="Thread workers (IO-bound).")
     args = ap.parse_args()

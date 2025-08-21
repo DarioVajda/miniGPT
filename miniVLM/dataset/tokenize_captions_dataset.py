@@ -1,8 +1,8 @@
 import sentencepiece as spm
 import tqdm
 
-tsv_train_dataset_path = "../captions_dataset/GCC-training.tsv"
-tsv_val_dataset_path = "../captions_dataset/GCC-1.1.0-Validation.tsv"
+tsv_train_dataset_path = "../../captions_dataset/GCC-training.tsv"
+tsv_val_dataset_path = "../../captions_dataset/GCC-1.1.0-Validation.tsv"
 
 tokenized_train_dataset_path = "tokenized_train_captions_dataset.txt"
 tokenized_val_dataset_path = "tokenized_val_captions_dataset.txt"

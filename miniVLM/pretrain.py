@@ -1,15 +1,16 @@
 from dataset.text_dataset import TextDataset
-from dataset.captions_dataset import CaptionsDataset
+from dataset.captions_dataset import CaptionsDataset, save_tensor_image
 from transformer import TransformerVLM, count_parameters
 
-import os
+import os, sys
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
-import torch.functional as F
 import time
 import math
 from torch import nn
+from tqdm import tqdm
+import torchvision.transforms as T
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device: ", "cuda" if torch.cuda.is_available() else "cpu")
@@ -55,8 +56,8 @@ print(f"Captions datasets loaded: {len(train_captions_dataset)} training samples
 #endregion
 
 #region DataLoaders
-text_batch_size = 2
-captions_batch_size = 256 # Using larger batch size because these examples are shorter (in terms of toknens)
+text_batch_size = 1
+captions_batch_size = 4
 
 num_cpu_cores = len(os.sched_getaffinity(0))
 print(f"Detected {num_cpu_cores} CPU cores.")
@@ -76,7 +77,10 @@ val_text_dataloader = DataLoader(
 )
 
 # {"image": img, "caption_ids": cap_ids, "index": true_idx} <----- this is an element of CaptionsDataset
-captions_collate_fn = lambda batch: ([b["caption_ids"] for b in batch], [[b["image"]] for b in batch])
+def captions_collate_fn(batch):
+    captions = [b["caption_ids"] for b in batch if b['image'] is not None]
+    images = [[b["image"]] for b in batch if b['image'] is not None]
+    return (captions, images)
 train_captions_dataloader = DataLoader(
     train_captions_dataset,
     batch_size=captions_batch_size,
@@ -96,8 +100,8 @@ val_captions_dataloader = DataLoader(
 #region Training hyperparameters
 
 train_tokens = 50_000_000  # 50m tokens (for testing) ---> 5_000_000_000 for full training
-eval_tokens = 100_000  # 100k tokens (for testing)  ---> 50_000_000 for full validation
-eval_steps = train_tokens//20 # Evaluate ~20 times during training
+eval_tokens = 50_000  # 50k tokens (for testing)  ---> 50_000_000 for full validation
+eval_steps = train_tokens//500 # Evaluate ~100 times during training
 
 #endregion
 
@@ -167,7 +171,6 @@ def make_cosine_with_warmup(optimizer, warmup, total, base_lr, min_lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 sched = make_cosine_with_warmup(optim, warmup_steps, max_steps, base_lr, min_lr)
-
 # test the scheduler
 def test_scheduler():
     for step in range(0, max_steps + 1, max(1, max_steps // 30)):
@@ -179,43 +182,16 @@ def test_scheduler():
             f"Max Steps = {max_steps}")
 # test_scheduler()  # Uncomment to test the scheduler
 
-
-# ----- mock training loop -----
-# Assume your DataLoader yields LongTensor batches: input_ids [B, T] with next-token labels
-"""
-for step, input_ids in enumerate(train_loader, start=1):
-    input_ids = input_ids.to(device)
-    with torch.autocast(device_type="cuda", dtype=dtype):
-        # typical causal LM loss (shift by one)
-        logits = model(input_ids)                            # [B, T, V]
-        loss = F.cross_entropy(
-            logits[:, :-1].contiguous().view(-1, logits.size(-1)),
-            input_ids[:, 1:].contiguous().view(-1),
-            ignore_index=-100  # or your PAD if you mask pads in the labels
-        ) / accum_steps
-
-    loss.backward()
-
-    if step % accum_steps == 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optim.step()
-        optim.zero_grad(set_to_none=True)
-        sched.step()
-
-    if step >= max_steps:
-        break
-"""
-
 #endregion
 
 #region Helper functions
 
-def safe_next(iterable, og_loader):
+def safe_next(it, loader):
     try:
-        return next(iterable)
+        return next(it), it
     except StopIteration:
-        # Reset the iterator if it runs out of data
-        return iter(og_loader)
+        it = iter(loader)
+        return next(it), it
 
 def nice_num(num):
     """Format a large number by adding k, M, B, T suffixes..."""
@@ -226,18 +202,76 @@ def nice_num(num):
     elif num >= 1_000:
         return f"{num / 1_000:.1f}k"
     else:
-        return str(num)
+        return f"{num:.1f}"
 
 def nice_time(seconds):
     """Format time in seconds to a human-readable format. (eg. 1h 30m 15s)"""
     if seconds < 60:
         return f"{seconds:.0f}s"
     elif seconds < 3600:
-        return f"{seconds // 6:.0f0}m {seconds % 60:.0f}s"
+        return f"{seconds // 60:.0f}m {seconds % 60:.0f}s"
     else:
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
         return f"{hours:.0f}h {minutes:.0f}m {seconds % 60:.0f}s"
+
+def inspect_images(captions_batch_img, save_dir="./test_image_batch", stop_program=True):
+    output_dir = Path(save_dir)
+    output_dir.mkdir(exist_ok=True)
+    for i, img in enumerate(captions_batch_img):
+        img_path = output_dir / f"image_{i:02d}.jpg"
+        save_tensor_image(img[0], img_path)
+
+    if stop_program:
+        print(f"Images saved to {output_dir}. Stopping the program for inspection.")
+        exit(0)
+
+def measure_time(func, *args, **kwargs):
+    """Measure the time taken by a function."""
+    start_time = time.time()
+    result = func(*args, **kwargs)
+    end_time = time.time()
+    return result, end_time - start_time
+
+#endregion
+
+#region Evaluation functions
+
+@torch.no_grad()
+def text_eval(model, val_text_dataloader, eval_tokens):
+    print("Evaluating text dataset...")
+    text_eval_loss = 0.0
+    text_eval_examples = 0
+    eval_tokens_processed = 0
+    for text_eval_batch, _ in tqdm(val_text_dataloader):
+        # move batch to device
+        text_eval_batch = [t.to(device) for t in text_eval_batch]
+        text_eval_examples += 1
+        # forward pass --> calculate loss
+        logits, loss = model(text_eval_batch, None, calculate_loss=True)
+        text_eval_loss += loss.item()
+
+        # update processed tokens
+        eval_tokens_processed += len(text_eval_batch) * text_eval_batch[0].shape[0]
+        if eval_tokens_processed >= eval_tokens:
+            break
+
+    text_eval_loss /= text_eval_examples
+    print("Finished evaluating text dataset.")
+    return text_eval_loss
+
+@torch.no_grad()
+def captions_eval(model, val_captions_dataloader):
+    print("Evaluating captions dataset...")
+    captions_eval_loss = 0.0
+    for captions_eval_batch_txt, captions_eval_batch_img in tqdm(val_captions_dataloader):
+        captions_eval_batch_txt = [c.to(device) for c in captions_eval_batch_txt]
+        captions_eval_batch_img = [ [img[0].to(device)] for img in captions_eval_batch_img ]
+        logits, loss = model(captions_eval_batch_txt, captions_eval_batch_img, calculate_loss=True)
+        captions_eval_loss += loss.item()
+    captions_eval_loss /= len(val_captions_dataloader)
+    print("Finished evaluating captions dataset.")
+    return captions_eval_loss
 
 #endregion
 
@@ -259,7 +293,7 @@ while TOTAL_TOKENS < train_tokens:
 
     # ------------ Perform training step on text dataset ----------------
     # Get a batch of text data
-    text_batch, _ = safe_next(text_dataset_iter, train_text_dataloader)
+    (text_batch, _), text_dataset_iter = safe_next(text_dataset_iter, train_text_dataloader)
     text_batch = [t.to(device) for t in text_batch]  # Move to device
 
     # Calculate the loss
@@ -271,12 +305,17 @@ while TOTAL_TOKENS < train_tokens:
     TOTAL_TOKENS += len(text_batch) * text_batch[0].shape[0]
     # -------------------------------------------------------------------
 
-    # ------------ Perform training step on captions dataset ------------ COMMENTED OUT FOR NOW
+    # ------------ Perform training step on captions dataset ------------
     # Get a batch of captions data
-    captions_batch_txt, captions_batch_img = safe_next(captions_dataset_iter, train_captions_dataloader)
+    (captions_batch_txt, captions_batch_img), captions_dataset_iter = safe_next(captions_dataset_iter, train_captions_dataloader)
+
+    captions_batch_txt = [ c.to(device) for c in captions_batch_txt ]               # Move to device
+    captions_batch_img = [ [ img[0].to(device) ] for img in captions_batch_img ]    # Move to device
 
     # Calculate the loss
-    # Don't update TOTAL_TOKENS here, as we are not counting captions tokens
+    logits, loss = model(captions_batch_txt, captions_batch_img, calculate_loss=True)
+    loss.backward()
+    captions_loss = loss.item()
     # -------------------------------------------------------------------
 
     # ------------ Optimizer step ----------------------------------------
@@ -290,13 +329,15 @@ while TOTAL_TOKENS < train_tokens:
 
     # ------------ Evaluation (every `eval_steps` tokens) ---------------
     if TOTAL_TOKENS >= NEXT_EVAL * eval_steps:
-        # Evaluate on text dataset
-            # Get a batch of text data
-            # Perform evaluation
+        model.eval()
 
-        # Evaluate on captions dataset
-            # Get a batch of captions data
-            # Perform evaluation
+        print(f"Starting evaluation #{NEXT_EVAL} at {nice_num(TOTAL_TOKENS)} tokens...")
+        text_eval_loss = text_eval(model, val_text_dataloader, eval_tokens)
+        captions_eval_loss = captions_eval(model, val_captions_dataloader)
+        print(f"Evaluation #{NEXT_EVAL} completed: ")
+        print(f"Text Loss: {text_eval_loss:.4f}, Captions Loss: {captions_eval_loss:.4f}")
+        
+        model.train()  
 
         NEXT_EVAL += 1
     # -------------------------------------------------------------------
@@ -304,11 +345,12 @@ while TOTAL_TOKENS < train_tokens:
     end_time = time.time()
     print(f"{TRAINING_STEPS}. {nice_num(TOTAL_TOKENS)}/{nice_num(train_tokens)} tokens ({(end_time-start_time):.2f} s/it; {nice_num(TOTAL_TOKENS / (end_time - training_start_time))} tok/s) - {nice_time(max((train_tokens - TOTAL_TOKENS) / (TOTAL_TOKENS / (end_time - training_start_time)),0))} left", end='')
     print(f" | Text Loss: {text_loss:.4f}", end='')
+    print(f" | Captions Loss: {captions_loss:.4f}", end='')
     if performed_update:
         print(f" | UPDATED with LR: {optim.param_groups[0]['lr']:.6f}", end='')
     print()
     # print format:
-    # 1. 50M/5B tokens (1.23 s/it; 2.3k tok/s) - 1h 30m left | Text Loss: 2.3456
+    # 1. 50M/5B tokens (1.23 s/it; 2.3k tok/s) - 1h 30m left | Text Loss: 2.3456 | Captions Loss: 1.2345 | UPDATED with LR: 0.000300
 
 
 #endregion
