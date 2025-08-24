@@ -32,20 +32,24 @@ MAX_SEQUENCE_LENGTH = 2048
 text_batch_size = 1
 captions_batch_size = 4
 
-train_tokens = 50_000_000  # 50m tokens (for testing) ---> 5_000_000_000 for full training
-eval_tokens = 100_000  # 50k tokens (for testing)  ---> 50_000_000 for full validation
-eval_steps = train_tokens//25 # Evaluate ~25 times during training
+train_tokens = 5_000_000_000  # 5_000_000_000 for full training
+eval_tokens = 1_000_000  # 1m tokens (for testing)  ---> 50_000_000 for full validation
+eval_steps = train_tokens//100  # Evaluate ~100 times during training
 
 base_lr      = 3e-4
 min_lr       = 0.1*base_lr  # 3e-5
 weight_decay = 0.1
-accum_steps  = 8            # gradient accumulation to reach your effective batch
+accum_steps  = 16             # gradient accumulation to reach your effective batch
 max_steps    = int(train_tokens/(text_batch_size*MAX_SEQUENCE_LENGTH*accum_steps))   # Approximate number of steps for training (train_tokens/tokens_per_step)
 warmup_steps = int(max_steps * 0.1)                                             # 10% of total steps for warmup
 grad_clip    = 1.0
 #endregion
 
 # ----------------- Checkpoint utils -----------------
+def save_model(path: str, model: DDP):
+    # Save underlying module state to keep it wrapper-agnostic
+    torch.save(model.module.state_dict() if isinstance(model, DDP) else model.state_dict(), path)
+
 def _atomic_save(obj: Dict[str, Any], path: str):
     tmp = path + ".tmp"
     torch.save(obj, tmp)
@@ -578,22 +582,22 @@ def main():
             if (checkpoint_path is not None) and (args.checkpoint_every > 0) and (UPDATE_STEPS % args.checkpoint_every == 0):
                 if rank == 0:
                     elapsed_for_ckpt = RESUMED_ELAPSED + (time.time() - training_start_time)
-                    # ---- NEW: compute "global" from local rank0 counts; avoid all collectives  # <--- NEW
-                    text_g = int(TEXT_EX_SEEN_LOCAL) * world_size  # <--- NEW
-                    caps_g = int(CAPS_EX_SEEN_LOCAL) * world_size  # <--- NEW
-                    text_list = [int(TEXT_EX_SEEN_LOCAL)] * world_size  # <--- NEW
-                    caps_list = [int(CAPS_EX_SEEN_LOCAL)] * world_size  # <--- NEW
+                    # ---- NEW: compute "global" from local rank0 counts; avoid all collectives
+                    text_g = int(TEXT_EX_SEEN_LOCAL) * world_size
+                    caps_g = int(CAPS_EX_SEEN_LOCAL) * world_size
+                    text_list = [int(TEXT_EX_SEEN_LOCAL)] * world_size
+                    caps_list = [int(CAPS_EX_SEEN_LOCAL)] * world_size
 
-                    loader_examples = {  # <--- NEW
-                        "world_size": world_size,         # <--- NEW
-                        "text_global": text_g,            # <--- NEW
-                        "caps_global": caps_g,            # <--- NEW
-                        "text_per_rank": text_list,       # <--- NEW
-                        "caps_per_rank": caps_list,       # <--- NEW
-                    }  # <--- NEW
+                    loader_examples = {
+                        "world_size": world_size,       
+                        "text_global": text_g,          
+                        "caps_global": caps_g,          
+                        "text_per_rank": text_list,     
+                        "caps_per_rank": caps_list,     
+                    }
 
                     print(f"[ckpt] Saving checkpoint at updates={UPDATE_STEPS}, micro-steps={TRAINING_STEPS}, tokens={TOTAL_TOKENS} → {checkpoint_path}")
-                    save_checkpoint(checkpoint_path, model, optim, sched, TRAINING_STEPS, UPDATE_STEPS, TOTAL_TOKENS, NEXT_EVAL, elapsed_for_ckpt, loader_examples)  # <--- NEW
+                    save_checkpoint(checkpoint_path, model, optim, sched, TRAINING_STEPS, UPDATE_STEPS, TOTAL_TOKENS, NEXT_EVAL, elapsed_for_ckpt, loader_examples)
                 if dist.is_initialized(): dist.barrier()  # keep ranks in sync after save (optional, harmless)
         # -------------------------------------------------------------------
 
@@ -614,6 +618,10 @@ def main():
             eval_time = time.time() - start_eval_time
             if rank == 0: print(f"Evaluation #{NEXT_EVAL-1} took {eval_time:.2f} seconds.")
 
+            if rank == 0:
+                print(f"Saving the model version to {args.output+'/model_step_'+str(UPDATE_STEPS)+'.pt'}")
+                save_model(f"{args.output}/model_step_{UPDATE_STEPS}.pt", model)
+
             # Log evaluation results to a JSONL file (optional)
             if args.output is not None and rank == 0:
                 eval_log_data = {
@@ -633,31 +641,31 @@ def main():
         tok_per_sec = TOTAL_TOKENS / max(total_elapsed, 1e-9)
         remaining_tokens = max(train_tokens - TOTAL_TOKENS, 0)
         eta_seconds = remaining_tokens / max(tok_per_sec, 1e-9)
-        if rank == 0: print(f"{TRAINING_STEPS}. {nice_num(TOTAL_TOKENS)}/{nice_num(train_tokens)} tokens ({(end_time-start_time-eval_time):.2f} s/it; {nice_num(tok_per_sec)} tok/s) - {nice_time(eta_seconds)} left", end='')  # <--- NEW
-        if rank == 0: print(f" | Text Loss: {text_loss:.4f}", end='')
-        if rank == 0: print(f" | Captions Loss: {captions_loss:.4f}", end='')
-        if sync_now:
-            if rank == 0: print(f" | UPDATED with LR: {optim.param_groups[0]['lr']:.6f}", end='')
-        if rank == 0: print()
-        # print format:
-        # 1. 50M/5B tokens (1.23 s/it; 2.3k tok/s) - 1h 30m left | Text Loss: 2.3456 | Captions Loss: 1.2345 | UPDATED with LR: 0.000300
+        if sync_now and rank == 0:
+            print(f"{TRAINING_STEPS}. {nice_num(TOTAL_TOKENS)}/{nice_num(train_tokens)} tokens ({(end_time-start_time-eval_time):.2f} s/it; {nice_num(tok_per_sec)} tok/s) - {nice_time(eta_seconds)} left", end='')
+            print(f" | Text Loss: {text_loss:.4f}", end='')
+            print(f" | Captions Loss: {captions_loss:.4f}", end='')
+            print(f" | UPDATED with LR: {optim.param_groups[0]['lr']:.6f}", end='')
+            print()
+            # print format:
+            # 1. 50M/5B tokens (1.23 s/it; 2.3k tok/s) - 1h 30m left | Text Loss: 2.3456 | Captions Loss: 1.2345 | UPDATED with LR: 0.000300
 
-        # log progress to a JSONL file (optional)
-        if args.output is not None and rank == 0:
-            log_data = {
-                "training_steps": TRAINING_STEPS,
-                "update_steps": UPDATE_STEPS,
-                "total_tokens": TOTAL_TOKENS,
-                "next_eval": NEXT_EVAL,
-                "elapsed_train_seconds": total_elapsed,
-                "text_loss": text_loss,
-                "captions_loss": captions_loss,
-                "time_per_step": end_time - start_time - eval_time,  # Time taken for this step
-                "tokens_per_second": tok_per_sec,  # Tokens processed per second
-                "learning_rate": optim.param_groups[0]["lr"],
-                "tokens_per_step": tokens_per_batch,  # Approximate number of tokens processed in this step
-            }
-            log_progress(os.path.join(args.output, "train.jsonl"), log_data)
+            # log progress to a JSONL file (optional)
+            if args.output is not None:
+                log_data = {
+                    "training_steps": TRAINING_STEPS,
+                    "update_steps": UPDATE_STEPS,
+                    "total_tokens": TOTAL_TOKENS,
+                    "next_eval": NEXT_EVAL,
+                    "elapsed_train_seconds": total_elapsed,
+                    "text_loss": text_loss,
+                    "captions_loss": captions_loss,
+                    "time_per_step": end_time - start_time - eval_time,  # Time taken for this step
+                    "tokens_per_second": tok_per_sec,  # Tokens processed per second
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "tokens_per_step": tokens_per_batch,  # Approximate number of tokens processed in this step
+                }
+                log_progress(os.path.join(args.output, "train.jsonl"), log_data)
 
 
     dist.destroy_process_group()

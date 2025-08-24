@@ -21,3 +21,7 @@ miniVLM/dataset/tokenized_val_captions_dataset.txt
 
 # checkpoint files
 miniVLM/**/*.pt
+
+# logs
+miniVLM/logs
+miniVLM/test_run
